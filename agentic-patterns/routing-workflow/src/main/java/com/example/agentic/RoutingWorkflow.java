@@ -16,7 +16,9 @@
 package com.example.agentic;
 
 import java.util.Map;
+import java.util.UUID;
 
+import io.diagrid.springai.durable.boot.DurableAdvisor;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.util.Assert;
 
@@ -77,10 +79,27 @@ import org.springframework.util.Assert;
  */
 public class RoutingWorkflow {
 
-    private final ChatClient chatClient;
+    private final ChatClient classifier;
 
+    private final ChatClient specialist;
+
+    /**
+     * Uses one client for both the classification and the specialist reply.
+     */
     public RoutingWorkflow(ChatClient chatClient) {
-        this.chatClient = chatClient;
+        this(chatClient, chatClient);
+    }
+
+    /**
+     * Uses a distinct client for each role, so the two show up as separate agents on Catalyst
+     * (each with its own workflow name and agent-registry entry) rather than as one.
+     *
+     * @param classifier the client that picks the route
+     * @param specialist the client that answers with the selected route's prompt
+     */
+    public RoutingWorkflow(ChatClient classifier, ChatClient specialist) {
+        this.classifier = classifier;
+        this.specialist = specialist;
     }
 
     /**
@@ -111,11 +130,24 @@ public class RoutingWorkflow {
      * @return Processed response from the selected specialized route
      */
     public String route(String input, Map<String, String> routes) {
+        return route(input, routes, UUID.randomUUID().toString());
+    }
+
+    /**
+     * As {@link #route(String, Map)}, but scheduling the classification and the specialist reply
+     * under durable instance ids derived from {@code runId} ({@code <runId>-classify} and
+     * {@code <runId>-handle}). Re-running with the same run id replays a completed
+     * classification from its record — so the same route is chosen and the specialist reply,
+     * the expensive half, is the only work left to do.
+     *
+     * @param runId identifies this ticket's run; see {@link #route(String, Map)} for the rest
+     */
+    public String route(String input, Map<String, String> routes, String runId) {
         Assert.notNull(input, "Input text cannot be null");
         Assert.notEmpty(routes, "Routes map cannot be null or empty");
 
         // Determine the appropriate route for the input
-        String routeKey = determineRoute(input, routes.keySet());
+        String routeKey = determineRoute(input, routes.keySet(), runId + "-classify");
 
         // Get the selected prompt from the routes map
         String selectedPrompt = routes.get(routeKey);
@@ -125,7 +157,10 @@ public class RoutingWorkflow {
         }
 
         // Process the input with the selected prompt
-        return chatClient.prompt(selectedPrompt + "\nInput: " + input).call().content();
+        return specialist.prompt(selectedPrompt + "\nInput: " + input)
+                .advisors(a -> a.param(DurableAdvisor.INSTANCE_ID_KEY, runId + "-handle"))
+                .call()
+                .content();
     }
 
     /**
@@ -145,10 +180,11 @@ public class RoutingWorkflow {
      *
      * @param input           The input text to analyze for routing
      * @param availableRoutes The set of available routing options
+     * @param instanceId      The durable instance id this classification runs under
      * @return The selected route key based on content analysis
      */
     @SuppressWarnings("null")
-    private String determineRoute(String input, Iterable<String> availableRoutes) {
+    private String determineRoute(String input, Iterable<String> availableRoutes, String instanceId) {
         System.out.println("\nAvailable routes: " + availableRoutes);
 
         String selectorPrompt = String.format("""
@@ -163,7 +199,10 @@ public class RoutingWorkflow {
 
                 Input: %s""", availableRoutes, input);
 
-        RoutingResponse routingResponse = chatClient.prompt(selectorPrompt).call().entity(RoutingResponse.class);
+        RoutingResponse routingResponse = classifier.prompt(selectorPrompt)
+                .advisors(a -> a.param(DurableAdvisor.INSTANCE_ID_KEY, instanceId))
+                .call()
+                .entity(RoutingResponse.class);
 
         System.out.println(String.format("Routing Analysis:%s\nSelected route: %s",
                 routingResponse.reasoning(), routingResponse.selection()));
