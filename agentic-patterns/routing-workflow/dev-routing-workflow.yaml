@@ -1,0 +1,7 @@
+version: 1
+common:
+  appLogDestination: console
+apps:
+  - appID: routing-workflow
+    appDirPath: ./
+    command: ["mvn", "spring-boot:run"]

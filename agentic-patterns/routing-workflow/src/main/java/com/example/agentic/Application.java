@@ -18,12 +18,15 @@ package com.example.agentic;
 
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.CommandLineRunner;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.context.annotation.Bean;
+import org.springframework.util.StringUtils;
 
 // ------------------------------------------------------------
 // ROUTER WORKFLOW
@@ -35,9 +38,26 @@ public class Application {
 		SpringApplication.run(Application.class, args);
 	}
 
+	/**
+	 * The two roles are separate {@code ChatClient} beans so each is its own agent on Catalyst,
+	 * with its own workflow name ({@code spring-ai.ticketClassifier.workflow} /
+	 * {@code spring-ai.supportSpecialist.workflow}) and agent-registry entry. Each is built from
+	 * the injected, Spring-managed builder — {@code clone()} keeps the durable advisor on both.
+	 */
 	@Bean
-	public CommandLineRunner commandLineRunner(ChatClient.Builder chatClientBuilder) {
-		
+	public ChatClient ticketClassifier(ChatClient.Builder chatClientBuilder) {
+		return chatClientBuilder.clone().build();
+	}
+
+	@Bean
+	public ChatClient supportSpecialist(ChatClient.Builder chatClientBuilder) {
+		return chatClientBuilder.clone().build();
+	}
+
+	@Bean
+	public CommandLineRunner commandLineRunner(ChatClient ticketClassifier, ChatClient supportSpecialist,
+			@Value("${routing.run-id:}") String configuredRunId) {
+
 		return args -> {
 			Map<String, String> supportRoutes = Map.of("billing",
 					"""
@@ -113,15 +133,24 @@ public class Application {
 							Best regards,
 							Mike""");
 
-			var routerWorkflow = new RoutingWorkflow(chatClientBuilder.build());
+			String runId = StringUtils.hasText(configuredRunId)
+					? configuredRunId
+					: UUID.randomUUID().toString();
+
+			System.out.println("\nRun id: " + runId);
+			System.out.println("Re-run with --routing.run-id=" + runId
+					+ " to resume: tickets already classified and answered replay from their records.\n");
+
+			var routerWorkflow = new RoutingWorkflow(ticketClassifier, supportSpecialist);
 
 			int i = 1;
 			for (String ticket : tickets) {
-				System.out.println("\nTicket " + i++);
+				System.out.println("\nTicket " + i);
 				System.out.println("------------------------------------------------------------");
 				System.out.println(ticket);
 				System.out.println("------------------------------------------------------------");
-				System.out.println(routerWorkflow.route(ticket, supportRoutes));
+				System.out.println(routerWorkflow.route(ticket, supportRoutes, runId + "-ticket-" + i));
+				i++;
 			}
 
 		};
