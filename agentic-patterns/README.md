@@ -2,6 +2,11 @@
 
 This project demonstrates practical implementations of the workflow patterns for building effective LLM-based systems, as described in [Anthropic's research on building effective agents](https://www.anthropic.com/research/building-effective-agents).
 
+> **This fork runs the patterns durably on [Diagrid Catalyst](https://docs.diagrid.io).** Every LLM
+> call executes as a Dapr Workflow, so a pattern interrupted part-way resumes from its last completed
+> step instead of restarting. The pattern logic below is unchanged Spring AI; see
+> **[CATALYST.md](CATALYST.md)** for the setup, what was changed, and how to watch a chain resume.
+
 ## Overview
 
 The project provides concrete implementations of five fundamental workflow patterns that can be used to build effective LLM-based systems. Each pattern is implemented as a separate module with its own specific use cases and benefits.
