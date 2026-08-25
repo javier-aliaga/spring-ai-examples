@@ -16,7 +16,10 @@
 package com.example.agentic;
 
 import java.util.List;
+import java.util.UUID;
+import java.util.stream.IntStream;
 
+import io.diagrid.springai.durable.boot.DurableAdvisor;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.util.Assert;
 
@@ -66,7 +69,8 @@ import org.springframework.util.Assert;
  */
 public class OrchestratorWorkers {
 
-	private final ChatClient chatClient;
+	private final ChatClient orchestrator;
+	private final ChatClient worker;
 	private final String orchestratorPrompt;
 	private final String workerPrompt;
 
@@ -140,7 +144,19 @@ public class OrchestratorWorkers {
 	 * @param chatClient The ChatClient to use for LLM interactions
 	 */
 	public OrchestratorWorkers(ChatClient chatClient) {
-		this(chatClient, DEFAULT_ORCHESTRATOR_PROMPT, DEFAULT_WORKER_PROMPT);
+		this(chatClient, chatClient, DEFAULT_ORCHESTRATOR_PROMPT, DEFAULT_WORKER_PROMPT);
+	}
+
+	/**
+	 * Creates a new OrchestratorWorkers with default prompts and a distinct client per role, so
+	 * the orchestrator and the workers show up as separate agents on Catalyst (each with its own
+	 * workflow name and agent-registry entry).
+	 *
+	 * @param orchestrator The ChatClient that decomposes the task
+	 * @param worker       The ChatClient that executes each subtask
+	 */
+	public OrchestratorWorkers(ChatClient orchestrator, ChatClient worker) {
+		this(orchestrator, worker, DEFAULT_ORCHESTRATOR_PROMPT, DEFAULT_WORKER_PROMPT);
 	}
 
 	/**
@@ -151,11 +167,26 @@ public class OrchestratorWorkers {
 	 * @param workerPrompt       Custom prompt for the worker LLMs
 	 */
 	public OrchestratorWorkers(ChatClient chatClient, String orchestratorPrompt, String workerPrompt) {
-		Assert.notNull(chatClient, "ChatClient must not be null");
+		this(chatClient, chatClient, orchestratorPrompt, workerPrompt);
+	}
+
+	/**
+	 * Creates a new OrchestratorWorkers with custom prompts and a distinct client per role.
+	 *
+	 * @param orchestrator       The ChatClient that decomposes the task
+	 * @param worker             The ChatClient that executes each subtask
+	 * @param orchestratorPrompt Custom prompt for the orchestrator LLM
+	 * @param workerPrompt       Custom prompt for the worker LLMs
+	 */
+	public OrchestratorWorkers(ChatClient orchestrator, ChatClient worker, String orchestratorPrompt,
+			String workerPrompt) {
+		Assert.notNull(orchestrator, "Orchestrator ChatClient must not be null");
+		Assert.notNull(worker, "Worker ChatClient must not be null");
 		Assert.hasText(orchestratorPrompt, "Orchestrator prompt must not be empty");
 		Assert.hasText(workerPrompt, "Worker prompt must not be empty");
 
-		this.chatClient = chatClient;
+		this.orchestrator = orchestrator;
+		this.worker = worker;
 		this.orchestratorPrompt = orchestratorPrompt;
 		this.workerPrompt = workerPrompt;
 	}
@@ -171,14 +202,30 @@ public class OrchestratorWorkers {
 	 *         worker outputs
 	 * @throws IllegalArgumentException if taskDescription is null or empty
 	 */
-	@SuppressWarnings("null")
 	public FinalResponse process(String taskDescription) {
+		return process(taskDescription, UUID.randomUUID().toString());
+	}
+
+	/**
+	 * As {@link #process(String)}, but scheduling the decomposition and each worker under durable
+	 * instance ids derived from {@code runId} ({@code <runId>-orchestrate} and
+	 * {@code <runId>-worker-<i>}). Re-running with the same run id replays a completed
+	 * decomposition from its record, which is what makes the worker ids stable: the same task
+	 * list comes back, so workers that already finished replay too and only the unfinished ones
+	 * call the model.
+	 *
+	 * @param runId identifies this run; see {@link #process(String)} for the rest
+	 * @return WorkerResponse containing the orchestrator's analysis and combined worker outputs
+	 */
+	@SuppressWarnings("null")
+	public FinalResponse process(String taskDescription, String runId) {
 		Assert.hasText(taskDescription, "Task description must not be empty");
 
 		// Step 1: Get orchestrator response
-		OrchestratorResponse orchestratorResponse = this.chatClient.prompt()
+		OrchestratorResponse orchestratorResponse = this.orchestrator.prompt()
 				.user(u -> u.text(this.orchestratorPrompt)
 						.param("task", taskDescription))
+				.advisors(a -> a.param(DurableAdvisor.INSTANCE_ID_KEY, runId + "-orchestrate"))
 				.call()
 				.entity(OrchestratorResponse.class);
 
@@ -186,13 +233,18 @@ public class OrchestratorWorkers {
 				orchestratorResponse.analysis(), orchestratorResponse.tasks()));
 
 		// Step 2: Process each task
-		List<String> workerResponses = orchestratorResponse.tasks().stream().map(task -> this.chatClient.prompt()
-				.user(u -> u.text(this.workerPrompt)
-						.param("original_task", taskDescription)
-						.param("task_type", task.type())
-						.param("task_description", task.description()))
-				.call()
-				.content()).toList();
+		List<Task> tasks = orchestratorResponse.tasks();
+		List<String> workerResponses = IntStream.range(0, tasks.size()).mapToObj(i -> {
+			Task task = tasks.get(i);
+			return this.worker.prompt()
+					.user(u -> u.text(this.workerPrompt)
+							.param("original_task", taskDescription)
+							.param("task_type", task.type())
+							.param("task_description", task.description()))
+					.advisors(a -> a.param(DurableAdvisor.INSTANCE_ID_KEY, runId + "-worker-" + i))
+					.call()
+					.content();
+		}).toList();
 
 		System.out.println("\n=== WORKER OUTPUT ===\n" + workerResponses);
 
