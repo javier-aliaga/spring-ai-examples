@@ -17,6 +17,7 @@
 	<properties>
 		<java.version>17</java.version>
 		<spring-ai.version>2.0.0</spring-ai.version>
+		<diagrid-spring-ai.version>0.2.0</diagrid-spring-ai.version>
 	</properties>
 	<dependencies>
 		<dependency>
@@ -24,15 +25,23 @@
 			<artifactId>spring-boot-starter-web</artifactId>
 		</dependency>
 
-
-		<!-- <dependency>
-			<groupId>org.springframework.ai</groupId>
-			<artifactId>spring-ai-starter-model-openai</artifactId>
-		</dependency> -->
-
 		<dependency>
 			<groupId>org.springframework.ai</groupId>
+			<artifactId>spring-ai-starter-model-openai</artifactId>
+		</dependency>
+
+		<!--  <dependency>
+			<groupId>org.springframework.ai</groupId>
 			<artifactId>spring-ai-starter-model-anthropic</artifactId>
+		</dependency> -->
+
+		<!-- THE ONLY THING THAT MAKES IT DURABLE. Adding this starter turns every
+		     ChatClient.call() into a Dapr Workflow on Catalyst; the workflow logic in
+		     ChainWorkflow.java is unchanged Spring AI. -->
+		<dependency>
+			<groupId>io.diagrid</groupId>
+			<artifactId>diagrid-spring-ai-starter</artifactId>
+			<version>${diagrid-spring-ai.version}</version>
 		</dependency>
 
 		<!-- <dependency>
