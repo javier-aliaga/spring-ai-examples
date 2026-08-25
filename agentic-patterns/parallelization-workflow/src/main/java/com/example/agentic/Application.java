@@ -16,12 +16,15 @@
 package com.example.agentic;
 
 import java.util.List;
+import java.util.UUID;
 
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.CommandLineRunner;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.context.annotation.Bean;
+import org.springframework.util.StringUtils;
 
 @SpringBootApplication
 public class Application {
@@ -30,15 +33,35 @@ public class Application {
 		SpringApplication.run(Application.class, args);
 	}
 
+	/**
+	 * The agent each parallel worker calls, exposed as a bean so Catalyst can identify it: the
+	 * bean name becomes the agent name in the agent registry and its workflow name
+	 * ({@code spring-ai.stakeholderAnalyst.workflow}). Building from the injected,
+	 * Spring-managed {@code ChatClient.Builder} is what carries the durable advisor.
+	 */
 	@Bean
-	public CommandLineRunner commandLineRunner(ChatClient.Builder chatClientBuilder) {
+	public ChatClient stakeholderAnalyst(ChatClient.Builder chatClientBuilder) {
+		return chatClientBuilder.build();
+	}
+
+	@Bean
+	public CommandLineRunner commandLineRunner(ChatClient stakeholderAnalyst,
+			@Value("${parallel.run-id:}") String configuredRunId) {
 
 		return args -> {
 			// ------------------------------------------------------------
 			// PARALLEL WORKFLOW
 			// ------------------------------------------------------------
 
-			List<String> parallelResponse = new ParallelizationlWorkflow(chatClientBuilder.build())
+			String runId = StringUtils.hasText(configuredRunId)
+					? configuredRunId
+					: UUID.randomUUID().toString();
+
+			System.out.println("\nRun id: " + runId);
+			System.out.println("Re-run with --parallel.run-id=" + runId
+					+ " to resume: inputs that already completed return their recorded results.\n");
+
+			List<String> parallelResponse = new ParallelizationlWorkflow(stakeholderAnalyst)
 					.parallel("""
 							Analyze how market changes will impact this stakeholder group.
 							Provide specific impacts and recommended actions.
@@ -72,7 +95,7 @@ public class Application {
 											- Price pressures
 											- Tech transitions
 											"""),
-							4);
+							4, runId);
 
 			System.out.println(parallelResponse);
 
