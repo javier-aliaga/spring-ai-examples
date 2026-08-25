@@ -16,11 +16,14 @@
 package com.example.agentic;
 
 import java.util.List;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
+import io.diagrid.springai.durable.boot.DurableAdvisor;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.util.Assert;
 
@@ -98,20 +101,40 @@ public class ParallelizationlWorkflow {
 	 *         the specific error details
 	 */
 	public List<String> parallel(String prompt, List<String> inputs, int nWorkers) {
+		return parallel(prompt, inputs, nWorkers, UUID.randomUUID().toString());
+	}
+
+	/**
+	 * As {@link #parallel(String, List, int)}, but scheduling each input's call under a durable
+	 * instance id derived from {@code runId} and the input's position
+	 * ({@code <runId>-input-<i>}). Re-running with the same run id returns the recorded result
+	 * for every input that already finished and only re-issues the ones that did not — so a
+	 * fan-out interrupted with two of four inputs done resumes having to pay for two.
+	 *
+	 * @param runId identifies this fan-out; see {@link #parallel(String, List, int)} for the rest
+	 */
+	public List<String> parallel(String prompt, List<String> inputs, int nWorkers, String runId) {
 		Assert.notNull(prompt, "Prompt cannot be null");
 		Assert.notEmpty(inputs, "Inputs list cannot be empty");
 		Assert.isTrue(nWorkers > 0, "Number of workers must be greater than 0");
 
 		ExecutorService executor = Executors.newFixedThreadPool(nWorkers);
 		try {
-			List<CompletableFuture<String>> futures = inputs.stream()
-					.map(input -> CompletableFuture.supplyAsync(() -> {
-						try {
-							return chatClient.prompt(prompt + "\nInput: " + input).call().content();
-						} catch (Exception e) {
-							throw new RuntimeException("Failed to process input: " + input, e);
-						}
-					}, executor))
+			List<CompletableFuture<String>> futures = IntStream.range(0, inputs.size())
+					.mapToObj(i -> {
+						String input = inputs.get(i);
+						String instanceId = runId + "-input-" + i;
+						return CompletableFuture.supplyAsync(() -> {
+							try {
+								return chatClient.prompt(prompt + "\nInput: " + input)
+										.advisors(a -> a.param(DurableAdvisor.INSTANCE_ID_KEY, instanceId))
+										.call()
+										.content();
+							} catch (Exception e) {
+								throw new RuntimeException("Failed to process input: " + input, e);
+							}
+						}, executor);
+					})
 					.collect(Collectors.toList());
 
 			// Wait for all tasks to complete
