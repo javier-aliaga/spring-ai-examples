@@ -16,13 +16,17 @@
 */
 package com.example.agentic;
 
+import java.util.UUID;
+
 import com.example.agentic.EvaluatorOptimizer.RefinedResponse;
 
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.CommandLineRunner;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.context.annotation.Bean;
+import org.springframework.util.StringUtils;
 
 // ------------------------------------------------------------
 // EVALUATOR-OPTIMIZER
@@ -35,11 +39,36 @@ public class Application {
 		SpringApplication.run(Application.class, args);
 	}
 
+	/**
+	 * The two roles are separate {@code ChatClient} beans so each is its own agent on Catalyst,
+	 * with its own workflow name ({@code spring-ai.solutionGenerator.workflow} /
+	 * {@code spring-ai.solutionEvaluator.workflow}) and agent-registry entry. Each is built from
+	 * the injected, Spring-managed builder — {@code clone()} keeps the durable advisor on both.
+	 */
 	@Bean
-	public CommandLineRunner commandLineRunner(ChatClient.Builder chatClientBuilder) {
-		var chatClient = chatClientBuilder.build();
+	public ChatClient solutionGenerator(ChatClient.Builder chatClientBuilder) {
+		return chatClientBuilder.clone().build();
+	}
+
+	@Bean
+	public ChatClient solutionEvaluator(ChatClient.Builder chatClientBuilder) {
+		return chatClientBuilder.clone().build();
+	}
+
+	@Bean
+	public CommandLineRunner commandLineRunner(ChatClient solutionGenerator, ChatClient solutionEvaluator,
+			@Value("${evaluator.run-id:}") String configuredRunId) {
 		return args -> {
-			RefinedResponse refinedResponse = new EvaluatorOptimizer(chatClient).loop("""
+			String runId = StringUtils.hasText(configuredRunId)
+					? configuredRunId
+					: UUID.randomUUID().toString();
+
+			System.out.println("\nRun id: " + runId);
+			System.out.println("Re-run with --evaluator.run-id=" + runId
+					+ " to resume: completed refinement rounds replay from their records.\n");
+
+			RefinedResponse refinedResponse = new EvaluatorOptimizer(solutionGenerator, solutionEvaluator)
+					.loop("""
 					<user input>
 					Implement a Stack in Java with:
 					1. push(x)
@@ -48,7 +77,7 @@ public class Application {
 					All operations should be O(1).
 					All inner fields should be private and when used should be prefixed with 'this.'.
 					</user input>
-					""");
+					""", runId);
 
 			System.out.println("FINAL OUTPUT:\n : " + refinedResponse);
 		};

@@ -17,7 +17,9 @@ package com.example.agentic;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.UUID;
 
+import io.diagrid.springai.durable.boot.DurableAdvisor;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.util.Assert;
 
@@ -145,24 +147,55 @@ public class EvaluatorOptimizer {
 	public static record RefinedResponse(String solution, List<Generation> chainOfThought) {
 	}
 
-	private final ChatClient chatClient;
+	/**
+	 * Cap on refinement rounds. The loop is otherwise unbounded — an evaluator that never
+	 * answers PASS would recurse forever, and on the durable path every round is a pair of
+	 * scheduled workflows.
+	 */
+	public static final int DEFAULT_MAX_ITERATIONS = 5;
+
+	private final ChatClient generator;
+
+	private final ChatClient evaluator;
 
 	private final String generatorPrompt;
 
 	private final String evaluatorPrompt;
 
+	private final int maxIterations;
+
 	public EvaluatorOptimizer(ChatClient chatClient) {
-		this(chatClient, DEFAULT_GENERATOR_PROMPT, DEFAULT_EVALUATOR_PROMPT);
+		this(chatClient, chatClient, DEFAULT_GENERATOR_PROMPT, DEFAULT_EVALUATOR_PROMPT, DEFAULT_MAX_ITERATIONS);
+	}
+
+	/**
+	 * Uses a distinct client per role, so the generator and the evaluator show up as separate
+	 * agents on Catalyst (each with its own workflow name and agent-registry entry).
+	 *
+	 * @param generator the ChatClient that produces and refines solutions
+	 * @param evaluator the ChatClient that critiques them
+	 */
+	public EvaluatorOptimizer(ChatClient generator, ChatClient evaluator) {
+		this(generator, evaluator, DEFAULT_GENERATOR_PROMPT, DEFAULT_EVALUATOR_PROMPT, DEFAULT_MAX_ITERATIONS);
 	}
 
 	public EvaluatorOptimizer(ChatClient chatClient, String generatorPrompt, String evaluatorPrompt) {
-		Assert.notNull(chatClient, "ChatClient must not be null");
+		this(chatClient, chatClient, generatorPrompt, evaluatorPrompt, DEFAULT_MAX_ITERATIONS);
+	}
+
+	public EvaluatorOptimizer(ChatClient generator, ChatClient evaluator, String generatorPrompt,
+			String evaluatorPrompt, int maxIterations) {
+		Assert.notNull(generator, "Generator ChatClient must not be null");
+		Assert.notNull(evaluator, "Evaluator ChatClient must not be null");
 		Assert.hasText(generatorPrompt, "Generator prompt must not be empty");
 		Assert.hasText(evaluatorPrompt, "Evaluator prompt must not be empty");
+		Assert.isTrue(maxIterations > 0, "Max iterations must be greater than 0");
 
-		this.chatClient = chatClient;
+		this.generator = generator;
+		this.evaluator = evaluator;
 		this.generatorPrompt = generatorPrompt;
 		this.evaluatorPrompt = evaluatorPrompt;
+		this.maxIterations = maxIterations;
 	}
 
 	/**
@@ -188,10 +221,25 @@ public class EvaluatorOptimizer {
 	 *         showing the evolution of the solution
 	 */
 	public RefinedResponse loop(String task) {
+		return loop(task, UUID.randomUUID().toString());
+	}
+
+	/**
+	 * As {@link #loop(String)}, but scheduling each round's generate and evaluate calls under
+	 * durable instance ids derived from {@code runId} ({@code <runId>-generate-<n>} and
+	 * {@code <runId>-evaluate-<n>}). Re-running with the same run id replays completed rounds
+	 * from their records, which is what keeps the ids stable: the same solutions and the same
+	 * feedback come back, so the accumulated context — and therefore round n+1 — is identical.
+	 * A refinement loop interrupted in round 3 resumes in round 3.
+	 *
+	 * @param runId identifies this run
+	 * @return A RefinedResponse containing the final solution and the chain of thought
+	 */
+	public RefinedResponse loop(String task, String runId) {
 		List<String> memory = new ArrayList<>();
 		List<Generation> chainOfThought = new ArrayList<>();
 
-		return loop(task, "", memory, chainOfThought);
+		return loop(task, "", memory, chainOfThought, runId, 1);
 	}
 
 	/**
@@ -210,16 +258,24 @@ public class EvaluatorOptimizer {
 	 *         history
 	 */
 	private RefinedResponse loop(String task, String context, List<String> memory,
-			List<Generation> chainOfThought) {
+			List<Generation> chainOfThought, String runId, int iteration) {
 
-		Generation generation = generate(task, context);
+		Generation generation = generate(task, context, runId + "-generate-" + iteration);
 		memory.add(generation.response());
 		chainOfThought.add(generation);
 
-		EvaluationResponse evaluationResponse = evalute(generation.response(), task);
+		EvaluationResponse evaluationResponse = evalute(generation.response(), task,
+				runId + "-evaluate-" + iteration);
 
 		if (evaluationResponse.evaluation().equals(EvaluationResponse.Evaluation.PASS)) {
 			// Solution is accepted!
+			return new RefinedResponse(generation.response(), chainOfThought);
+		}
+
+		if (iteration >= this.maxIterations) {
+			System.out.println(String.format(
+					"\n=== STOPPING ===\nReached the %s-iteration cap without a PASS; returning the last attempt.\n",
+					this.maxIterations));
 			return new RefinedResponse(generation.response(), chainOfThought);
 		}
 
@@ -232,7 +288,7 @@ public class EvaluatorOptimizer {
 		}
 		newContext.append("\nFeedback: ").append(evaluationResponse.feedback());
 
-		return loop(task, newContext.toString(), memory, chainOfThought);
+		return loop(task, newContext.toString(), memory, chainOfThought, runId, iteration + 1);
 	}
 
 	/**
@@ -244,12 +300,13 @@ public class EvaluatorOptimizer {
 	 * @param context Previous attempts and feedback for iterative improvement
 	 * @return A Generation containing the model's thoughts and proposed solution
 	 */
-	private Generation generate(String task, String context) {
-		Generation generationResponse = chatClient.prompt()
+	private Generation generate(String task, String context, String instanceId) {
+		Generation generationResponse = generator.prompt()
 				.user(u -> u.text("{prompt}\n{context}\nTask: {task}")
 						.param("prompt", this.generatorPrompt)
 						.param("context", context)
 						.param("task", task))
+				.advisors(a -> a.param(DurableAdvisor.INSTANCE_ID_KEY, instanceId))
 				.call()
 				.entity(Generation.class);
 
@@ -273,13 +330,14 @@ public class EvaluatorOptimizer {
 	 *         (PASS/NEEDS_IMPROVEMENT/FAIL)
 	 *         and detailed feedback for improvement
 	 */
-	private EvaluationResponse evalute(String content, String task) {
+	private EvaluationResponse evalute(String content, String task, String instanceId) {
 
-		EvaluationResponse evaluationResponse = chatClient.prompt()
+		EvaluationResponse evaluationResponse = evaluator.prompt()
 				.user(u -> u.text("{prompt}\nOriginal task: {task}\nContent to evaluate: {content}")
 						.param("prompt", this.evaluatorPrompt)
 						.param("task", task)
 						.param("content", content))
+				.advisors(a -> a.param(DurableAdvisor.INSTANCE_ID_KEY, instanceId))
 				.call()
 				.entity(EvaluationResponse.class);
 

@@ -1,0 +1,7 @@
+version: 1
+common:
+  appLogDestination: console
+apps:
+  - appID: evaluator-optimizer
+    appDirPath: ./
+    command: ["mvn", "spring-boot:run"]
